@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Markdown → Confluence</title>
+    <link rel="stylesheet" href="converter.css">
+</head>
+<body>
+    <form id="form" novalidate>
+        <header>
+            <h1>Markdown → Confluence wiki markup</h1>
+            <p class="hint">
+                For pages where the paste interception is not available.
+                Convert here, then paste into the editor's
+                <strong>Insert → Markup</strong> dialog with markup type
+                <strong>Confluence Wiki</strong>.
+            </p>
+        </header>
+
+        <div class="panes">
+            <label class="field">
+                <span class="field-label">
+                    Markdown
+                    <span class="counter" id="counter"></span>
+                </span>
+                <textarea id="input" spellcheck="false"
+                    placeholder="Paste Markdown here."></textarea>
+            </label>
+
+            <div class="field">
+                <span class="field-label">Wiki markup</span>
+                <pre class="preview" id="preview"></pre>
+            </div>
+        </div>
+
+        <div class="actions">
+            <button type="submit" id="copy" class="primary">Convert &amp; copy</button>
+            <button type="button" id="clear">Clear</button>
+            <span class="status" id="status" role="status"></span>
+        </div>
+    </form>
+
+    <script src="markdown.js"></script>
+    <script src="converter.js"></script>
+</body>
+</html>

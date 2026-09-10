@@ -1,56 +1,31 @@
 /*
- * Markdown → Confluence converter.
+ * Markdown → Confluence wiki markup.
  *
- * Two stages, so that one parser can feed several clipboard formats:
+ * Two stages:
  *
- *   1. parse()   Markdown text  → a small block tree.
- *   2. render*() that block tree → one clipboard target.
+ *   1. parse()      Markdown text  → a small block tree.
+ *   2. renderWiki() that block tree → Confluence wiki markup.
  *
- * Targets:
- *
- *   html-pre     Rich HTML. Code blocks become <pre><code class="language-x">.
- *                The safest, least surprising option; Confluence usually
- *                turns these into "Preformatted" blocks without language
- *                specific highlighting.
- *
- *   html-macro   Rich HTML, but code blocks, callouts and task lists are
- *                emitted as Confluence storage-format macros. Whether the
- *                editor's paste filter keeps them depends on the instance,
- *                so this one has to be tried against a real page.
- *
- *   wiki         Confluence wiki markup as plain text, for the editor's
- *                Insert → Markup dialog. Highest fidelity for code blocks,
- *                since {code:language=x} is a real Code Block macro, but it
- *                needs one extra dialog instead of a plain paste.
+ * Wiki markup is the only output this produces, because it is the only one
+ * Confluence converts server-side. Hand-built HTML — whether <pre><code> or
+ * storage-format macros — gets rewritten by the editor's paste filter and
+ * loses its code blocks. Wiki markup is handed to Confluence's own converter
+ * instead, so {code:language=x} comes back as a real Code Block macro.
  *
  * Inline text is kept as raw Markdown in the block tree and parsed lazily by
- * parseInline(), so each renderer can escape it according to its own rules.
+ * parseInline(), so the renderer can escape it on its own terms.
+ *
+ * Loaded as a plain script by both the converter page and the content
+ * script, and published as a global rather than an ES module export:
+ * content scripts cannot be modules, and dynamic import() is not dependably
+ * available to them across browsers.
  */
 
-export const TARGETS = ["html-pre", "html-macro", "wiki"];
-
-
-export function convert(markdown, options = {}) {
-    const target = TARGETS.includes(options.target)
-        ? options.target
-        : "html-pre";
-
-    const doc = parse(markdown);
-
-    if (target === "wiki") {
-        return {
-            target,
-            html: null,
-            plain: renderWiki(doc)
-        };
-    }
-
-    return {
-        target,
-        html: renderHtml(doc, target),
-        plain: markdown
-    };
+function toWikiMarkup(markdown) {
+    return renderWiki(parse(markdown));
 }
+
+globalThis.MarkdownToConfluence = { toWikiMarkup };
 
 
 /* ------------------------------------------------------------------ *
@@ -669,15 +644,19 @@ const INLINE = new RegExp([
 ].map(pattern => pattern.source).join("|"), "g");
 
 
+/*
+ * matchAll, not exec: this function recurses into the contents of emphasis,
+ * links and the like, and INLINE carries the /g/ flag. A nested scan sharing
+ * that regex would reset its lastIndex, sending the outer scan back to the
+ * start of the string and looping forever. matchAll clones the regex
+ * internally, so every level of recursion gets its own cursor.
+ */
 function parseInline(text) {
     const nodes = [];
 
     let last = 0;
-    let match;
 
-    INLINE.lastIndex = 0;
-
-    while ((match = INLINE.exec(text)) !== null) {
+    for (const match of text.matchAll(INLINE)) {
         if (match.index > last) {
             nodes.push({ t: "text", v: text.slice(last, match.index) });
         }
@@ -687,7 +666,11 @@ function parseInline(text) {
         const g = match.groups;
 
         if (g.esc !== undefined) {
-            nodes.push({ t: "text", v: g.esc.slice(1) });
+            /*
+             * Distinct from plain text: the author escaped this character
+             * on purpose, so it has to stay literal on the way out too.
+             */
+            nodes.push({ t: "literal", v: g.esc.slice(1) });
         } else if (g.code !== undefined) {
             nodes.push({ t: "code", v: g.code.replace(/^ (.*) $/, "$1") });
         } else if (g.embed !== undefined) {
@@ -748,301 +731,6 @@ function parseInline(text) {
     }
 
     return nodes;
-}
-
-
-/* ------------------------------------------------------------------ *
- * HTML rendering
- * ------------------------------------------------------------------ */
-
-function renderHtml(doc, target) {
-    const ctx = { target, footnoteNumbers: doc.footnoteNumbers };
-    const parts = doc.blocks.map(block => htmlBlock(block, ctx));
-
-    if (doc.notes.length > 0) {
-        parts.push("<hr />");
-        parts.push(
-            "<ol>" +
-            doc.notes
-                .map(note =>
-                    "<li>" +
-                    parseBlocks(note.lines)
-                        .map(block => htmlBlock(block, ctx))
-                        .join("") +
-                    "</li>"
-                )
-                .join("") +
-            "</ol>"
-        );
-    }
-
-    return parts.join("\n");
-}
-
-
-function htmlBlock(block, ctx) {
-    switch (block.type) {
-        case "heading":
-            return (
-                `<h${block.level}>` +
-                htmlInline(parseInline(block.text), ctx) +
-                `</h${block.level}>`
-            );
-
-        case "para":
-            return `<p>${htmlInline(parseInline(block.text), ctx)}</p>`;
-
-        case "hr":
-            return "<hr />";
-
-        case "code":
-            return htmlCode(block, ctx);
-
-        case "list":
-            return htmlList(block, ctx);
-
-        case "quote":
-            return htmlQuote(block, ctx);
-
-        case "table":
-            return htmlTable(block, ctx);
-
-        default:
-            return "";
-    }
-}
-
-
-function htmlCode(block, ctx) {
-    if (ctx.target === "html-macro") {
-        const language = confluenceLanguage(block.lang);
-
-        return (
-            '<ac:structured-macro ac:name="code" ac:schema-version="1">' +
-            (language
-                ? '<ac:parameter ac:name="language">' +
-                  escapeHtml(language) +
-                  "</ac:parameter>"
-                : "") +
-            "<ac:plain-text-body>" +
-            cdata(block.code) +
-            "</ac:plain-text-body>" +
-            "</ac:structured-macro>"
-        );
-    }
-
-    const languageClass = block.lang
-        ? ` class="language-${escapeHtml(block.lang)}"`
-        : "";
-
-    return (
-        `<pre><code${languageClass}>` +
-        escapeHtml(block.code) +
-        "</code></pre>"
-    );
-}
-
-
-function htmlList(block, ctx) {
-    const allTasks =
-        block.items.length > 0 &&
-        block.items.every(item => item.checked !== null);
-
-    if (ctx.target === "html-macro" && allTasks) {
-        return (
-            "<ac:task-list>" +
-            block.items
-                .map(item =>
-                    "<ac:task>" +
-                    "<ac:task-status>" +
-                    (item.checked ? "complete" : "incomplete") +
-                    "</ac:task-status>" +
-                    "<ac:task-body>" +
-                    htmlItemBody(item, ctx) +
-                    "</ac:task-body>" +
-                    "</ac:task>"
-                )
-                .join("") +
-            "</ac:task-list>"
-        );
-    }
-
-    const tag = block.ordered ? "ol" : "ul";
-    const start =
-        block.ordered && block.start > 1 ? ` start="${block.start}"` : "";
-
-    return (
-        `<${tag}${start}>` +
-        block.items
-            .map(item => {
-                const box =
-                    item.checked === null
-                        ? ""
-                        : item.checked
-                        ? "☑ "
-                        : "☐ ";
-
-                return `<li>${box}${htmlItemBody(item, ctx)}</li>`;
-            })
-            .join("") +
-        `</${tag}>`
-    );
-}
-
-
-/*
- * The first paragraph of a list item is rendered without a <p> wrapper so
- * that a nested list follows the text directly, which is what the editor
- * expects.
- */
-function htmlItemBody(item, ctx) {
-    return item.blocks
-        .map((block, index) =>
-            index === 0 && block.type === "para"
-                ? htmlInline(parseInline(block.text), ctx)
-                : htmlBlock(block, ctx)
-        )
-        .join("");
-}
-
-
-function htmlQuote(block, ctx) {
-    const macro = block.callout
-        ? CALLOUT_MACRO[block.callout.kind]
-        : undefined;
-
-    const body = block.blocks
-        .map(inner => htmlBlock(inner, ctx))
-        .join("");
-
-    if (ctx.target === "html-macro" && macro) {
-        const title = block.callout.title;
-
-        return (
-            `<ac:structured-macro ac:name="${macro}" ac:schema-version="1">` +
-            (title
-                ? '<ac:parameter ac:name="title">' +
-                  escapeHtml(title) +
-                  "</ac:parameter>"
-                : "") +
-            `<ac:rich-text-body>${body}</ac:rich-text-body>` +
-            "</ac:structured-macro>"
-        );
-    }
-
-    const heading =
-        block.callout && block.callout.title
-            ? `<p><strong>${escapeHtml(block.callout.title)}</strong></p>`
-            : block.callout
-            ? `<p><strong>${escapeHtml(calloutLabel(block.callout.kind))}</strong></p>`
-            : "";
-
-    return `<blockquote>${heading}${body}</blockquote>`;
-}
-
-
-function htmlTable(block, ctx) {
-    const cell = (tag, text, align) => {
-        const style = align ? ` style="text-align: ${align};"` : "";
-
-        return `<${tag}${style}>${htmlInline(parseInline(text), ctx)}</${tag}>`;
-    };
-
-    return (
-        "<table><thead><tr>" +
-        block.header
-            .map((text, c) => cell("th", text, block.align[c]))
-            .join("") +
-        "</tr></thead><tbody>" +
-        block.rows
-            .map(row =>
-                "<tr>" +
-                row.map((text, c) => cell("td", text, block.align[c])).join("") +
-                "</tr>"
-            )
-            .join("") +
-        "</tbody></table>"
-    );
-}
-
-
-function htmlInline(nodes, ctx) {
-    return nodes.map(node => htmlNode(node, ctx)).join("");
-}
-
-
-function htmlNode(node, ctx) {
-    switch (node.t) {
-        case "text":
-            return escapeHtml(node.v);
-
-        case "code":
-            return `<code>${escapeHtml(node.v)}</code>`;
-
-        case "strong":
-            return `<strong>${htmlInline(node.c, ctx)}</strong>`;
-
-        case "em":
-            return `<em>${htmlInline(node.c, ctx)}</em>`;
-
-        case "del":
-            return `<del>${htmlInline(node.c, ctx)}</del>`;
-
-        case "mark":
-            return (
-                '<span style="background-color: #FFF59D;">' +
-                htmlInline(node.c, ctx) +
-                "</span>"
-            );
-
-        case "link": {
-            const title = node.title
-                ? ` title="${escapeHtml(node.title)}"`
-                : "";
-
-            return (
-                `<a href="${escapeHtml(node.href)}"${title}>` +
-                htmlInline(node.c, ctx) +
-                "</a>"
-            );
-        }
-
-        case "img": {
-            const title = node.title
-                ? ` title="${escapeHtml(node.title)}"`
-                : "";
-
-            return (
-                `<img src="${escapeHtml(node.src)}"` +
-                ` alt="${escapeHtml(node.alt)}"${title} />`
-            );
-        }
-
-        /*
-         * Obsidian embeds point at local vault files, which Confluence
-         * cannot resolve. The marker is kept verbatim so it is obvious that
-         * an attachment still has to be added by hand.
-         */
-        case "embed":
-            return escapeHtml(`![[${node.v}]]`);
-
-        case "wikilink":
-            return escapeHtml(node.alias || node.target);
-
-        case "footnote": {
-            const number = ctx.footnoteNumbers.get(node.id);
-
-            return number === undefined
-                ? escapeHtml(`[^${node.id}]`)
-                : `<sup>${number}</sup>`;
-        }
-
-        case "br":
-            return "<br />";
-
-        default:
-            return "";
-    }
 }
 
 
@@ -1198,6 +886,13 @@ function wikiNode(node, ctx) {
     switch (node.t) {
         case "text":
             return escapeWiki(node.v);
+
+        /*
+         * A Markdown escape such as \* would otherwise emit a bare
+         * asterisk, which Confluence reads as bold.
+         */
+        case "literal":
+            return WIKI_SPECIAL.test(node.v) ? `\\${node.v}` : node.v;
 
         case "code":
             return `{{${node.v}}}`;
@@ -1400,32 +1095,22 @@ function confluenceLanguage(language) {
 }
 
 
-function escapeHtml(value) {
-    return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#39;");
-}
+/*
+ * Characters that begin a wiki construct, and so need a backslash when they
+ * are meant literally.
+ */
+const WIKI_SPECIAL = /[*_\-+^~{}\[\]|!\\]/;
 
 
 /*
  * Braces and brackets start wiki macros and links, so literal ones have to
  * be escaped or the paste will silently lose text.
+ *
+ * Only these four are escaped wholesale. The rest of WIKI_SPECIAL — dashes,
+ * underscores, asterisks — appear far too often in ordinary prose, and
+ * Confluence only treats them as markup at word boundaries, so escaping
+ * every one would litter the output with visible backslashes.
  */
 function escapeWiki(value) {
     return String(value).replace(/([{}\[\]])/g, "\\$1");
-}
-
-
-/*
- * CDATA cannot contain "]]>", so a run is split across two sections.
- */
-function cdata(value) {
-    return (
-        "<![CDATA[" +
-        String(value).split("]]>").join("]]]]><![CDATA[>") +
-        "]]>"
-    );
 }

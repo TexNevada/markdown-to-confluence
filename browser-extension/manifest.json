@@ -1,20 +1,28 @@
 {
   "manifest_version": 3,
   "name": "Markdown → Confluence",
-  "version": "0.2.0",
-  "description": "Converts Markdown on the clipboard into rich HTML or Confluence wiki markup, so pasting into on-premise Confluence keeps code blocks and formatting.",
+  "version": "0.3.0",
+  "description": "Paste Obsidian Markdown straight into the on-premise Confluence editor with working code blocks, by routing it through Confluence's own wiki markup converter.",
   "permissions": [
+    "activeTab",
     "clipboardRead",
-    "clipboardWrite"
+    "contextMenus",
+    "scripting",
+    "storage"
   ],
+  "optional_host_permissions": [
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
-    "default_title": "Markdown → Confluence",
-    "default_popup": "popup.html"
+    "default_title": "Markdown → Confluence: click to enable on this site"
   },
   "browser_specific_settings": {
     "gecko": {
       "id": "markdown-confluence@example.local",
-      "strict_min_version": "115.0"
+      "strict_min_version": "128.0"
     }
   }
 }
