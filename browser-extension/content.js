@@ -35,7 +35,8 @@
     const BRIDGE_TIMEOUT_MS = 2000;
 
     const TOGGLE_KEY = `toggle:${location.origin}`;
-    const STRATEGY_KEY = `strategy:${location.origin}`;
+
+    const darkPreferred = matchMedia("(prefers-color-scheme: dark)");
 
     let editorDocument = null;
     let toggle = null;
@@ -58,6 +59,7 @@
 
         watchForEditor();
         watchToggleChanges();
+        watchThemeChanges();
     }
 
 
@@ -223,113 +225,43 @@
      * -------------------------------------------------------------- */
 
     /*
-     * Which endpoint an on-premise instance exposes varies by version, so
-     * both known candidates are tried and the one that worked is remembered
-     * per origin.
+     * Confluence's public REST API. Two round trips, because wiki → editor
+     * is not a supported conversion pair — only wiki → storage and
+     * storage → editor are.
+     *
+     * An earlier version also tried /rest/tinymce/1/wikixhtmlconverter, the
+     * endpoint Confluence's own Insert → Markup dialog uses, since it does
+     * the job in one request. It fails on this instance, and parts of its
+     * request body are undocumented, so it was dropped rather than carried
+     * as a guess. This path is the documented interface and demonstrably
+     * works.
      */
-    const STRATEGIES = [
-        {
-            id: "wikixhtmlconverter",
-
-            /*
-             * The endpoint Confluence's own Insert → Markup dialog posts to.
-             * One round trip, and it returns HTML rather than JSON.
-             *
-             * The body shape is only partly documented: `contextType` has no
-             * published set of values, and `entityId` rejects 0 on pages
-             * that have never been saved. Both are dropped in turn.
-             */
-            async run(wiki, context) {
-                const base = {
-                    wiki,
-                    spaceKey: context.spaceKey,
-                    suppressFirstParagraph: false
-                };
-
-                const variants = [
-                    { ...base, entityId: context.pageId, contextType: "PAGE" },
-                    { ...base, entityId: context.pageId },
-                    base
-                ];
-
-                let failure;
-
-                for (const body of variants) {
-                    const response = await post(
-                        `${context.base}/rest/tinymce/1/wikixhtmlconverter`,
-                        body
-                    );
-
-                    if (response.ok) {
-                        return await response.text();
-                    }
-
-                    failure = await toError(response);
-
-                    if (response.status !== 400) {
-                        break;
-                    }
-                }
-
-                throw failure;
-            }
-        },
-        {
-            id: "contentbody",
-
-            /*
-             * The public REST API. Two steps, because wiki → editor is not a
-             * supported pair; only wiki → storage and storage → editor are.
-             */
-            async run(wiki, context) {
-                const storage = await postJson(
-                    `${context.base}/rest/api/contentbody/convert/storage`,
-                    { value: wiki, representation: "wiki" }
-                );
-
-                const editor = await postJson(
-                    `${context.base}/rest/api/contentbody/convert/editor`,
-                    {
-                        value: storage.value,
-                        representation: "storage",
-                        ...(context.pageId
-                            ? { content: { id: String(context.pageId) } }
-                            : {})
-                    }
-                );
-
-                return editor.value;
-            }
-        }
-    ];
-
-
     async function convertOnServer(wiki) {
         const context = readContext();
-        const preferred = await readStrategy();
-        const ordered = [...STRATEGIES].sort(
-            (a, b) => (b.id === preferred) - (a.id === preferred)
+
+        const storage = await postJson(
+            `${context.base}/rest/api/contentbody/convert/storage`,
+            { value: wiki, representation: "wiki" }
         );
 
-        let failure;
+        const editor = await postJson(
+            `${context.base}/rest/api/contentbody/convert/editor`,
+            {
+                value: storage.value,
+                representation: "storage",
 
-        for (const strategy of ordered) {
-            try {
-                const html = await strategy.run(wiki, context);
-
-                await writeStrategy(strategy.id);
-
-                return html;
-            } catch (error) {
-                if (error.fatal) {
-                    throw error;
-                }
-
-                failure = error;
+                /*
+                 * Gives macros and links the page context they need to
+                 * render. Omitted on a page that has never been saved,
+                 * which has no id yet.
+                 */
+                ...(context.pageId
+                    ? { content: { id: String(context.pageId) } }
+                    : {})
             }
-        }
+        );
 
-        throw failure || new Error("no conversion endpoint responded");
+        return editor.value;
     }
 
 
@@ -355,8 +287,12 @@
     }
 
 
-    function post(url, body) {
-        return fetch(url, {
+    /*
+     * Same-origin, so the session cookie rides along automatically. The
+     * XSRF header is what Confluence's own callers send.
+     */
+    async function postJson(url, body) {
+        const response = await fetch(url, {
             method: "POST",
             credentials: "same-origin",
             headers: {
@@ -365,11 +301,6 @@
             },
             body: JSON.stringify(body)
         });
-    }
-
-
-    async function postJson(url, body) {
-        const response = await post(url, body);
 
         if (!response.ok) {
             throw await toError(response);
@@ -380,18 +311,21 @@
 
 
     async function toError(response) {
+        /*
+         * These return a login page, so the body is noise rather than a
+         * useful message.
+         */
+        if (response.status === 401 || response.status === 403) {
+            return new Error(
+                "Confluence rejected the request — your session may have expired"
+            );
+        }
+
         const detail = (await response.text().catch(() => "")).slice(0, 200);
-        const error = new Error(
+
+        return new Error(
             `HTTP ${response.status}${detail ? ` — ${detail}` : ""}`
         );
-
-        /*
-         * A dead session will fail identically on every endpoint, so there
-         * is no point working through the rest of the list.
-         */
-        error.fatal = response.status === 401;
-
-        return error;
     }
 
 
@@ -481,14 +415,40 @@
 
 
     /* -------------------------------------------------------------- *
-     * The M↓ toggle
+     * The Markdown mark toggle
      * -------------------------------------------------------------- */
+
+    /*
+     * The official Markdown mark (static/66x40.png), inlined.
+     *
+     * It is used as a CSS alpha mask rather than an <img>, for two reasons.
+     * The artwork is pure black on transparent, so masking it and painting
+     * `currentColor` underneath recolours it for free — one asset covers
+     * light, dark, on and off. And inlining avoids exposing the file through
+     * web_accessible_resources, which an <img src=runtime.getURL(...)> in a
+     * page-side shadow root would require.
+     */
+    const MARK_DATA_URI =
+        "data:image/png;base64," +
+        "iVBORw0KGgoAAAANSUhEUgAAAEIAAAAoCAQAAADgMuRfAAABZklEQVR4Ae3YtdYT" +
+        "URiG0Y1rgzU4De70WDUl1mMVF4HdBU6JT5v273F63N1dPhziulYOkve5gLOTzMRg" +
+        "gsNuiATdcNgEmOGhSNhDszkmEpfzRAgrpdhKITwnfEmqhS/1ED1EM4goarNa2yCK" +
+        "qr4oqgPEKwtV20KvuocIl4xWvtEuiW4iQkH5CqLbiLBN8baJFIgPMgCZD2kQ4aFp" +
+        "YLKHIhUinDL4S6dESkTY96VIgah97MHuIYY5K6p01rDuIZjmoeqXafUjdosG7W4d" +
+        "QSbKyqiJGKxP1KnP4HYQ7BRF7aQOgnGuCtW7ahztIQYoFL2JD2iAYJ5XokqvzKNN" +
+        "RNFH1lWjaYhgtajSOjpBsMTbLy2hKQQ7RVk76RTB5i9pGkEuisrpGNHGu8BIF8SP" +
+        "LhiZBsE094RwzzRSIVjm7ZdWkhLBli/1fnf0EH8n4okQMimWCeE5uUhczuz0f5zB" +
+        "BMfcFgm67ZgJfAZJA3GF0B+BSQAAAABJRU5ErkJggg==";
+
 
     /*
      * Lives in a shadow root so Confluence's stylesheets cannot reach it and
      * its own styles cannot leak out, and in the top document rather than
      * the editor iframe — anything placed in the iframe would become part of
      * the page being edited.
+     *
+     * Geometry follows the mark's 1.625 aspect ratio rather than the circle
+     * the old text button used.
      */
     const TOGGLE_STYLES = `
         :host {
@@ -506,22 +466,33 @@
             flex-direction: column;
             align-items: flex-end;
             gap: 6px;
+
+            --surface: #ffffff;
+            --mark: #6b778c;
+            --edge: #c1c7d0;
+            --on-surface: #0052cc;
+            --on-mark: #ffffff;
+        }
+
+        .wrap[data-theme="dark"] {
+            --surface: #22272b;
+            --mark: #9fadbc;
+            --edge: #38414a;
+            --on-surface: #4c9aff;
+            --on-mark: #1d2125;
         }
 
         button {
             display: flex;
             align-items: center;
             justify-content: center;
-            width: 40px;
-            height: 40px;
+            width: 46px;
+            height: 34px;
             padding: 0;
-            border: 1px solid #c1c7d0;
-            border-radius: 50%;
-            background: #ffffff;
-            color: #6b778c;
-            font-size: 15px;
-            font-weight: 600;
-            line-height: 1;
+            border: 1px solid var(--edge);
+            border-radius: 6px;
+            background: var(--surface);
+            color: var(--mark);
             cursor: pointer;
             box-shadow: 0 1px 4px rgba(9, 30, 66, 0.25);
             transition: background 120ms, color 120ms, border-color 120ms;
@@ -529,13 +500,41 @@
 
         button[aria-pressed="true"] {
             border-color: transparent;
-            background: #0052cc;
-            color: #ffffff;
+            background: var(--on-surface);
+            color: var(--on-mark);
         }
 
         button:focus-visible {
-            outline: 2px solid #0052cc;
+            outline: 2px solid var(--on-surface);
             outline-offset: 2px;
+        }
+
+        .mark {
+            width: 26px;
+            height: 16px;
+            background-color: currentColor;
+            -webkit-mask-image: url("${MARK_DATA_URI}");
+            mask-image: url("${MARK_DATA_URI}");
+            -webkit-mask-size: contain;
+            mask-size: contain;
+            -webkit-mask-repeat: no-repeat;
+            mask-repeat: no-repeat;
+            -webkit-mask-position: center;
+            mask-position: center;
+        }
+
+        /*
+         * Without mask support the mark would be an invisible empty box, so
+         * fall back to painting the artwork itself. Black only, but present.
+         */
+        @supports not ((mask-image: none) or (-webkit-mask-image: none)) {
+            .mark {
+                background-color: transparent;
+                background-image: url("${MARK_DATA_URI}");
+                background-size: contain;
+                background-repeat: no-repeat;
+                background-position: center;
+            }
         }
 
         .toast {
@@ -573,22 +572,24 @@
         const wrap = document.createElement("div");
         const toast = document.createElement("div");
         const button = document.createElement("button");
+        const mark = document.createElement("span");
 
         style.textContent = TOGGLE_STYLES;
         wrap.className = "wrap";
         toast.className = "toast";
         button.type = "button";
-        button.textContent = "M↓";
+        mark.className = "mark";
 
         button.addEventListener("click", () => {
             void setEnabled(!enabled);
         });
 
+        button.append(mark);
         wrap.append(toast, button);
         root.append(style, wrap);
         document.body.append(host);
 
-        toggle = { host, button, toast, timer: 0 };
+        toggle = { host, wrap, button, toast, timer: 0 };
 
         paintToggle();
     }
@@ -605,10 +606,125 @@
             return;
         }
 
+        toggle.wrap.dataset.theme = resolveTheme();
         toggle.button.setAttribute("aria-pressed", String(enabled));
+        toggle.button.setAttribute(
+            "aria-label",
+            enabled ? "Markdown conversion on" : "Markdown conversion off"
+        );
         toggle.button.title = enabled
             ? "Markdown conversion on — pasted Markdown becomes Confluence markup"
             : "Markdown conversion off — pasting behaves normally";
+    }
+
+
+    /* -------------------------------------------------------------- *
+     * Light or dark
+     * -------------------------------------------------------------- */
+
+    /*
+     * Relative luminance below which a background counts as dark. This is
+     * the WCAG crossover point where white text becomes more readable than
+     * black, not the midpoint — luminance is non-linear, so sRGB mid-grey
+     * is only 0.216 and a 0.5 threshold would call most light greys dark.
+     */
+    const DARK_THRESHOLD = 0.179;
+
+    /*
+     * Atlassian's design tokens declare the colour mode on <html>. Those
+     * attribute names are unverified for Confluence DC 9 — I could not
+     * establish whether DC 9 ships a dark theme at all — so the luminance
+     * check below is the load-bearing path. It works whatever mechanism the
+     * instance uses, including a custom space colour scheme.
+     */
+    function resolveTheme() {
+        const root = document.documentElement;
+        const declared =
+            `${root.dataset.colorMode || ""} ${root.dataset.theme || ""}`;
+
+        if (/dark/i.test(declared)) {
+            return "dark";
+        }
+
+        if (/light/i.test(declared)) {
+            return "light";
+        }
+
+        const luminance = backgroundLuminance();
+
+        if (luminance !== null) {
+            return luminance < DARK_THRESHOLD ? "dark" : "light";
+        }
+
+        return darkPreferred.matches ? "dark" : "light";
+    }
+
+
+    /*
+     * Walks up from the body for the first background that is actually
+     * painted; elements default to transparent, so the nearest opaque
+     * ancestor is what the user sees.
+     */
+    function backgroundLuminance() {
+        let node = document.body;
+
+        while (node) {
+            const colour = parseColour(
+                getComputedStyle(node).backgroundColor
+            );
+
+            if (colour) {
+                const [r, g, b] = colour.map(channel => {
+                    const v = channel / 255;
+
+                    return v <= 0.03928
+                        ? v / 12.92
+                        : ((v + 0.055) / 1.055) ** 2.4;
+                });
+
+                return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            }
+
+            node = node.parentElement;
+        }
+
+        return null;
+    }
+
+
+    /*
+     * Returns null for anything fully transparent, so the walk continues.
+     */
+    function parseColour(value) {
+        const match = /^rgba?\(([^)]+)\)$/.exec(value || "");
+
+        if (!match) {
+            return null;
+        }
+
+        const parts = match[1].split(/[,\s/]+/).map(Number);
+
+        if (parts.length < 3 || parts.slice(0, 3).some(Number.isNaN)) {
+            return null;
+        }
+
+        const alpha = parts.length > 3 ? parts[3] : 1;
+
+        return alpha === 0 ? null : parts.slice(0, 3);
+    }
+
+
+    /*
+     * Confluence can switch theme without a reload, so the toggle has to be
+     * repainted rather than coloured once at creation.
+     */
+    function watchThemeChanges() {
+        darkPreferred.addEventListener("change", paintToggle);
+
+        new MutationObserver(paintToggle).observe(document.documentElement, {
+            attributes: true,
+            attributeFilter: ["data-color-mode", "data-theme", "class"]
+        });
     }
 
 
@@ -672,18 +788,6 @@
                 paintToggle();
             }
         });
-    }
-
-
-    async function readStrategy() {
-        const stored = await chrome.storage.local.get(STRATEGY_KEY);
-
-        return stored[STRATEGY_KEY] || null;
-    }
-
-
-    async function writeStrategy(id) {
-        await chrome.storage.local.set({ [STRATEGY_KEY]: id });
     }
 
 

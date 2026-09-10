@@ -15,10 +15,9 @@
  * Inline text is kept as raw Markdown in the block tree and parsed lazily by
  * parseInline(), so the renderer can escape it on its own terms.
  *
- * Loaded as a plain script by both the converter page and the content
- * script, and published as a global rather than an ES module export:
- * content scripts cannot be modules, and dynamic import() is not dependably
- * available to them across browsers.
+ * Loaded as a plain script by the content script and published as a global
+ * rather than an ES module export: content scripts cannot be modules, and
+ * dynamic import() is not dependably available to them across browsers.
  */
 
 function toWikiMarkup(markdown) {
@@ -763,6 +762,22 @@ function renderWiki(doc) {
 }
 
 
+/*
+ * A macro-opening token appearing inside what should be plain code. Matches
+ * both `{code}` / `{noformat}` and their parameterised `{code:...}` form.
+ */
+const MACRO_IN_BODY = /\{(?:code|noformat)[:}]/i;
+
+
+
+function refuseMacroBody(what) {
+    throw new Error(
+        `${what} contains Confluence macro markup ({code} or {noformat}), ` +
+        "which wiki markup has no way to escape"
+    );
+}
+
+
 function wikiBlock(block, ctx) {
     switch (block.type) {
         case "heading":
@@ -775,6 +790,21 @@ function wikiBlock(block, ctx) {
             return "----";
 
         case "code":
+            /*
+             * A macro body runs literally until its closing token, and wiki
+             * markup provides no way to escape that token. A body containing
+             * {code} would therefore close the macro early and leave the
+             * rest of the document to be parsed as live markup — including
+             * any macro call it happens to contain.
+             *
+             * There is no correct encoding, so refuse rather than emit
+             * markup that means something other than the input. content.js
+             * catches this and pastes the original text unconverted.
+             */
+            if (MACRO_IN_BODY.test(block.code)) {
+                refuseMacroBody("a code block");
+            }
+
             return block.lang
                 ? `{code:language=${confluenceLanguage(block.lang)}}\n` +
                   `${block.code}\n{code}`
@@ -894,7 +924,15 @@ function wikiNode(node, ctx) {
         case "literal":
             return WIKI_SPECIAL.test(node.v) ? `\\${node.v}` : node.v;
 
+        /*
+         * Same hazard as a fenced block, one line smaller: `{code}` would
+         * render as {{{code}}}, which is ambiguous to tokenise.
+         */
         case "code":
+            if (MACRO_IN_BODY.test(node.v)) {
+                refuseMacroBody("an inline code span");
+            }
+
             return `{{${node.v}}}`;
 
         case "strong":

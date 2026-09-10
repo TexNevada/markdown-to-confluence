@@ -16,15 +16,17 @@ ROOT = Path(__file__).resolve().parent
 
 MANIFEST = "manifest.json"
 
-# Everything except the manifest, which is generated per browser.
+# Everything except the manifest, which is generated per browser. Only the
+# generated icons ship; the source artwork in static/ stays in the repo.
 ASSETS = [
     "background.js",
     "content.js",
     "bridge.js",
     "markdown.js",
-    "converter.html",
-    "converter.css",
-    "converter.js",
+    "static/icon-16.png",
+    "static/icon-32.png",
+    "static/icon-48.png",
+    "static/icon-128.png",
 ]
 
 REQUIRED_KEYS = ("manifest_version", "name", "version", "description")
@@ -51,6 +53,9 @@ def validate(manifest: dict) -> None:
     # Every file the manifest points at must actually be packaged. Content
     # scripts are registered at runtime, so they are not listed here.
     referenced = [manifest.get("background", {}).get("service_worker")]
+
+    referenced.extend(manifest.get("icons", {}).values())
+    referenced.extend(manifest.get("action", {}).get("default_icon", {}).values())
 
     for entry in manifest.get("web_accessible_resources", []):
         referenced.extend(entry.get("resources", []))

@@ -1,12 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Markdown → Confluence",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Paste Obsidian Markdown straight into the on-premise Confluence editor with working code blocks, by routing it through Confluence's own wiki markup converter.",
   "permissions": [
     "activeTab",
-    "clipboardRead",
-    "contextMenus",
     "scripting",
     "storage"
   ],
@@ -17,7 +15,19 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_title": "Markdown → Confluence: click to enable on this site"
+    "default_title": "Markdown → Confluence: click to enable on this site",
+    "default_icon": {
+      "16": "static/icon-16.png",
+      "32": "static/icon-32.png",
+      "48": "static/icon-48.png",
+      "128": "static/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "static/icon-16.png",
+    "32": "static/icon-32.png",
+    "48": "static/icon-48.png",
+    "128": "static/icon-128.png"
   },
   "browser_specific_settings": {
     "gecko": {

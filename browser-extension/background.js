@@ -11,7 +11,6 @@
  */
 
 const SCRIPT_PREFIX = "mdconf";
-const CONVERTER_MENU_ID = "mdconf-open-converter";
 const BADGE_TEXT = "M↓";
 const BADGE_COLOUR = "#0052cc";
 
@@ -199,35 +198,6 @@ async function paintBadge(tabId, on) {
 
 
 /* ------------------------------------------------------------------ *
- * The manual converter
- * ------------------------------------------------------------------ */
-
-chrome.runtime.onInstalled.addListener(() => {
-    chrome.contextMenus.removeAll(() => {
-        chrome.contextMenus.create({
-            id: CONVERTER_MENU_ID,
-            title: "Open Markdown converter…",
-            contexts: ["action"]
-        });
-    });
-
-    void reconcile();
-});
-
-
-chrome.runtime.onStartup.addListener(() => void reconcile());
-
-
-chrome.contextMenus.onClicked.addListener(info => {
-    if (info.menuItemId === CONVERTER_MENU_ID) {
-        void chrome.tabs.create({
-            url: chrome.runtime.getURL("converter.html")
-        });
-    }
-});
-
-
-/* ------------------------------------------------------------------ *
  * Keeping registrations and permissions in step
  * ------------------------------------------------------------------ */
 
@@ -251,6 +221,12 @@ chrome.permissions.onAdded.addListener(permissions => {
 });
 
 
+chrome.runtime.onInstalled.addListener(() => void reconcile());
+
+
+chrome.runtime.onStartup.addListener(() => void reconcile());
+
+
 /*
  * Permissions can also be revoked from the browser's own extension
  * settings, which leaves registrations behind that can never run.
@@ -258,14 +234,40 @@ chrome.permissions.onAdded.addListener(permissions => {
 async function reconcile() {
     const scopes = await loadGranted();
     const registered = await chrome.scripting.getRegisteredContentScripts();
+    const ours = registered.filter(script =>
+        script.id.startsWith(`${SCRIPT_PREFIX}-`)
+    );
 
-    const stale = registered
-        .filter(script => script.id.startsWith(`${SCRIPT_PREFIX}-`))
+    const stale = ours
         .filter(script => !(script.matches || []).some(m => scopes.has(m)))
         .map(script => script.id);
 
     if (stale.length > 0) {
         await chrome.scripting.unregisterContentScripts({ ids: stale });
+    }
+
+    /*
+     * And the reverse: an extension reload can drop the registrations while
+     * the host permission survives, which would leave a site looking
+     * enabled — permission held, badge shown — but with nothing injected,
+     * and the next icon click would disable it instead of fixing it.
+     */
+    const present = new Set(ours.map(script => script.id));
+
+    for (const scope of scopes) {
+        const origin = originOf(scope.replace(/\/\*$/, "/"));
+
+        /*
+         * Only ever concrete origins; a wildcard host would register the
+         * content scripts against every site.
+         */
+        if (!origin || origin.includes("*")) {
+            continue;
+        }
+
+        if (!present.has(scriptId(origin, "content"))) {
+            await register(origin);
+        }
     }
 }
 
